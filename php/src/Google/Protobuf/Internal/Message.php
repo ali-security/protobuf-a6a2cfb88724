@@ -677,6 +677,14 @@ class Message
     }
 
     /**
+     * @internal
+     */
+    public function getUnknown()
+    {
+        return $this->unknown;
+    }
+
+    /**
      * Merges the contents of the specified message into current message.
      *
      * This method merges the contents of the specified message into the
@@ -865,9 +873,20 @@ class Message
                 if (is_integer($value)) {
                     return $value;
                 }
-                $enum_value = $field->getEnumType()->getValueByName($value);
+                $enum_desc = $field->getEnumType();
+                $enum_value = null;
+                $enum_value_desc = $enum_desc->getValueByCustomJsonName($value);
+                if (!is_null($enum_value_desc)) {
+                    $enum_value = $enum_value_desc->getNumber();
+                }
+                if (is_null($enum_value)) {
+                    $enum_value_desc = $enum_desc->getValueByName($value);
+                    if (!is_null($enum_value_desc)) {
+                        $enum_value = $enum_value_desc->getNumber();
+                    }
+                }
                 if (!is_null($enum_value)) {
-                    return $enum_value->getNumber();
+                    return $enum_value;
                 } else if ($ignore_unknown) {
                     return $this->defaultValue($field);
                 } else {
@@ -1774,8 +1793,15 @@ class Message
                 } else {
                     $enum_value_desc = $enum_desc->getValueByNumber($value);
                     if (!is_null($enum_value_desc)) {
-                        $size += 2;  // size for ""
-                        $size += strlen($enum_value_desc->getName());
+                        $custom_name = $enum_value_desc->getCustomJsonName();
+                        if (!is_null($custom_name)) {
+                            $encoded = json_encode(
+                                $custom_name, JSON_UNESCAPED_UNICODE);
+                            $size += strlen($encoded);
+                        } else {
+                            $size += 2;  // size for ""
+                            $size += strlen($enum_value_desc->getName());
+                        }
                     } else {
                         $str_value = strval($value);
                         $size += strlen($str_value);

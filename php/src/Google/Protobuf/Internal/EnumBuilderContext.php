@@ -26,10 +26,10 @@ class EnumBuilderContext
         $this->pool = $pool;
     }
 
-    public function value($name, $number)
+    public function value($name, $number, $custom_json_name = null)
     {
-        $value = new EnumValueDescriptor($name, $number);
-        $this->descriptor->addValue($number, $value);
+        $value = new EnumValueDescriptor($name, $number, $custom_json_name);
+        $this->descriptor->addValue($number, $value, $custom_json_name);
         return $this;
     }
 

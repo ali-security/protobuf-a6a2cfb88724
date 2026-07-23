@@ -13,14 +13,16 @@ class EnumValueDescriptor
 {
     private $name;
     private $number;
+    private $custom_json_name;
 
     /**
      * @internal
      */
-    public function __construct($name, $number)
+    public function __construct($name, $number, $custom_json_name = null)
     {
         $this->name = $name;
         $this->number = $number;
+        $this->custom_json_name = $custom_json_name;
     }
 
     /**
@@ -37,5 +39,14 @@ class EnumValueDescriptor
     public function getNumber()
     {
         return $this->number;
+    }
+
+    /**
+     * @internal
+     * @return string|null
+     */
+    public function getCustomJsonName()
+    {
+        return $this->custom_json_name;
     }
 }

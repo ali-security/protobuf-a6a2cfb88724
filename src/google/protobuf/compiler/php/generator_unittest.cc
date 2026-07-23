@@ -9,6 +9,8 @@
 
 #include "google/protobuf/descriptor.pb.h"
 #include <gtest/gtest.h>
+#include "absl/strings/string_view.h"
+#include "absl/strings/substitute.h"
 #include "google/protobuf/compiler/command_line_interface_tester.h"
 #include "google/protobuf/compiler/php/php_generator.h"
 
@@ -197,20 +199,48 @@ TEST_F(PhpGeneratorTest, UnicodePhpNamespaceAccepted) {
   ExpectNoErrors();
 }
 
-// TODO Remove this test once full Edition 2026 support is in PHP
-TEST_F(PhpGeneratorTest, Edition2026Fails) {
-  CreateTempFile("foo.proto",
-                 R"schema(
+TEST_F(PhpGeneratorTest, CustomEnumNames) {
+#ifdef PROTO2_OPENSOURCE
+  constexpr absl::string_view kJsonOptionsPath =
+      "google/protobuf/json_enumvalue_options.proto";
+  constexpr absl::string_view kDescriptorPath =
+      "google/protobuf/descriptor.proto";
+#else
+  constexpr absl::string_view kJsonOptionsPath =
+      "google/protobuf/json_enumvalue_options.proto";
+  constexpr absl::string_view kDescriptorPath =
+      "google/protobuf/descriptor.proto";
+#endif
+
+  CreateTempFile(kJsonOptionsPath, absl::Substitute(R"schema(
+    edition = "2024";
+    package pb.enumvalue;
+    import "$0";
+    message JsonEnumValueOptions {
+      string string = 1;
+    }
+    extend google.protobuf.EnumValueOptions {
+      JsonEnumValueOptions json = 998;
+    }
+  )schema",
+                                                    kDescriptorPath));
+
+  CreateTempFile("foo.proto", absl::Substitute(R"schema(
     edition = "2026";
-    enum Foo {
-      BAR = 0;
-    })schema");
+    package foo;
+    import "$0";
+    enum MyEnum {
+      MY_ENUM_UNKNOWN = 0;
+      MY_ENUM_BAR = 1 [(pb.enumvalue.json).string = "custom_bar"];
+      MY_ENUM_BAZ = 2;
+    }
+  )schema",
+                                               kJsonOptionsPath));
 
   RunProtoc(
       "protocol_compiler --proto_path=$tmpdir --php_out=$tmpdir foo.proto");
 
-  ExpectErrorSubstring(
-      "PHP does not yet fully support Edition 2026, but is coming soon.");
+  ExpectNoErrors();
 }
 
 }  // namespace
