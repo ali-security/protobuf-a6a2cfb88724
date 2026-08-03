@@ -46,7 +46,6 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":internal",
-        ":message_unknowns",
         ":types",
         "//upb/base",
         "//upb/base:internal",
@@ -90,6 +89,8 @@ cc_library(
         "//upb/mem:internal",
         "//upb/mini_table",
         "//upb/port",
+        "//upb/wire:back_alloc",
+        "//upb/wire:encoder",
         "//upb/wire:eps_copy_input_stream",
         "//upb/wire:reader",
     ],
@@ -527,6 +528,8 @@ cc_test(
     deps = [
         ":internal",
         ":message",
+        ":message_test_upb_minitable_proto",
+        ":message_test_upb_proto",
         ":message_unknowns",
         "//upb/base",
         "//upb/mem",
