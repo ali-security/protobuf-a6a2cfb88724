@@ -1,4 +1,3 @@
----
 # Rebuilds the complete public PyPI artifact set for protobuf 3.19.5 (25 files).
 #
 # Upstream 3.19.x built its Python wheels on Kokoro, not GitHub Actions, so this
@@ -32,9 +31,9 @@ on:
 env:
   # Registry time machine: resolve dependencies as they were at the 3.19.5
   # release date (2022-09-14) so era-correct setuptools/wheel are picked.
-  PIP_INDEX_URL: "https://:2022-09-14@time-machines-pypi.sealsecurity.io/"
+  PIP_INDEX_URL: https://:2022-09-14@time-machines-pypi.sealsecurity.io/
   # Modern setuptools removed the distutils shims these 2022-era setup.py files rely on.
-  SETUPTOOLS_USE_DISTUTILS: "stdlib"
+  SETUPTOOLS_USE_DISTUTILS: stdlib
 
 jobs:
   # =====================================================================
@@ -120,6 +119,7 @@ jobs:
   #    Produced by `auditwheel repair`, which is what creates the
   #    protobuf.libs/ directory present in the real published wheels.
   # =====================================================================
+    timeout-minutes: 40
   linux_x86_64:
     name: manylinux x86_64 ${{ matrix.python }}
     runs-on: ubuntu-latest
@@ -132,7 +132,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["cp36-cp36m", "cp37-cp37m", "cp38-cp38", "cp39-cp39", "cp310-cp310"]
+        python: [cp36-cp36m, cp37-cp37m, cp38-cp38, cp39-cp39, cp310-cp310]
     steps:
       - uses: actions/checkout@v4
 
@@ -231,13 +231,14 @@ jobs:
   #    test suite CANNOT execute here (wrong architecture). That is expected;
   #    the pure-python and cpp suites are covered by the linux_x86_64 job.
   # =====================================================================
+    timeout-minutes: 40
   linux_aarch64:
     name: manylinux2014 aarch64 ${{ matrix.python }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python: ["cp37-cp37m", "cp38-cp38", "cp39-cp39", "cp310-cp310"]
+        python: [cp37-cp37m, cp38-cp38, cp39-cp39, cp310-cp310]
     steps:
       - uses: actions/checkout@v4
 
@@ -323,13 +324,14 @@ jobs:
   #    exactly. MACOSX_DEPLOYMENT_TARGET is deliberately NOT pinned to 10.9 for
   #    the extension build -- see the wheel step below. wheel==0.37.1 stays.
   # =====================================================================
+    timeout-minutes: 40
   macos:
     name: macOS x86_64 py${{ matrix.python }}
     runs-on: macos-14
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.6", "3.7", "3.8", "3.9"]
+        python: ['3.6', '3.7', '3.8', '3.9']
     steps:
       - uses: actions/checkout@v4
 
@@ -461,14 +463,15 @@ jobs:
   #      * zlib is NOT fetched: the upstream winimage.com URLs are dead, and
   #        zlib is optional for the Python extension.
   # =====================================================================
+    timeout-minutes: 40
   windows:
     name: Windows ${{ matrix.arch }} py${{ matrix.python }}
     runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.6", "3.7", "3.8", "3.9", "3.10"]
-        arch: ["x86", "x64"]
+        python: ['3.6', '3.7', '3.8', '3.9', '3.10']
+        arch: [x86, x64]
     steps:
       # text_format_test compares generated output against golden testdata that
       # test_util.GoldenFile opens 'rb', so a CRLF-translating checkout makes the
@@ -551,3 +554,4 @@ jobs:
           name: windows-${{ matrix.arch }}-py${{ matrix.python }}
           path: python/dist/*.whl
           if-no-files-found: error
+    timeout-minutes: 40
