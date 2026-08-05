@@ -1,0 +1,553 @@
+---
+# Rebuilds the complete public PyPI artifact set for protobuf 3.19.5 (25 files).
+#
+# Upstream 3.19.x built its Python wheels on Kokoro, not GitHub Actions, so this
+# workflow is a faithful port of:
+#   kokoro/release/python/linux/build_artifacts.sh   + linux/config.sh
+#   kokoro/release/python/macos/build_artifacts.sh   + macos/config.sh
+#   kokoro/release/python/windows/build_artifacts.bat + windows/build_single_artifact.bat
+#
+# Every leg keeps the Kokoro semantics: build protoc + libprotobuf from source with
+# -fPIC, run `setup.py build_py` to generate the _pb2.py files, then
+# `setup.py bdist_wheel --cpp_implementation --compile_static_extension`.
+#
+# Two different `wheel` pins are load-bearing for byte-equivalence, because the
+# "Generator: bdist_wheel (x.y.z)" line is recorded inside each wheel's WHEEL
+# metadata file:
+#   * wheel==0.37.1 -> sdist, pure wheel, manylinux_2_17_x86_64, macOS, Windows
+#   * wheel==0.36.2 -> the four manylinux2014_aarch64 wheels, because the pinned
+#     dockcross image shipped that older wheel at release time.
+#
+# Tests: protobuf's own suite (`setup.py test`, test_suite='google.protobuf.internal')
+# is run in BOTH implementations (pure python + cpp) per tox.ini. Nothing is
+# masked: no failure-swallowing shell suffixes, no job-level failure tolerance,
+# no deselects. Every test step's exit status is propagated as-is (on Windows
+# `cmd` that needs an explicit `exit /b 1`, which propagates rather than hides).
+
+name: Seal - protobuf 3.19.5 Python artifacts
+
+on:
+  workflow_dispatch:
+
+env:
+  # Registry time machine: resolve dependencies as they were at the 3.19.5
+  # release date (2022-09-14) so era-correct setuptools/wheel are picked.
+  PIP_INDEX_URL: "https://:2022-09-14@time-machines-pypi.sealsecurity.io/"
+  # Modern setuptools removed the distutils shims these 2022-era setup.py files rely on.
+  SETUPTOOLS_USE_DISTUTILS: "stdlib"
+
+jobs:
+  # =====================================================================
+  # 1) sdist + pure-python wheel  -> 2 artifacts
+  #      protobuf-3.19.5.tar.gz
+  #      protobuf-3.19.5-py2.py3-none-any.whl
+  #    setup.cfg sets `universal = 1`, so a plain bdist_wheel (NO
+  #    --cpp_implementation) yields the py2.py3-none-any tag.
+  # =====================================================================
+  sdist_and_pure:
+    name: sdist + pure wheel
+    runs-on: ubuntu-latest
+    # The manylinux2014 image is used via `docker run` from a plain ubuntu-latest
+    # runner, NOT as a job-level `container:`. manylinux2014 is CentOS 7
+    # (glibc 2.17) while the Actions runner injects its own Node 24 to execute
+    # every JavaScript action; Node 24 needs glibc >= 2.27, so inside that
+    # container actions/checkout, setup-python and upload-artifact all die with
+    # "CXXABI_1.3.11 not found / GLIBC_2.27 not found" before any build runs.
+    # Keeping the JS actions on the modern host and the build in `docker run`
+    # is the pattern that already works for the aarch64 legs below.
+    #
+    # The image tag is pinned to the manylinux2014 release just before 3.19.5
+    # (2022-09-12): it is the last era-correct image that still ships
+    # cp36..cp310 (the current `latest` tag dropped cp36/cp37/cp38 entirely)
+    # and it already carries wheel==0.37.1 and setuptools 59.6.0/65.3.0.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist + pure wheel and run both test suites (in container)
+        run: |
+          set -ex
+          docker run --rm \
+            -v "$PWD":/work -w /work \
+            -e PIP_INDEX_URL="$PIP_INDEX_URL" \
+            -e SETUPTOOLS_USE_DISTUTILS="$SETUPTOOLS_USE_DISTUTILS" \
+            quay.io/pypa/manylinux2014_x86_64:2022-09-12-1a61614 \
+            bash -c '
+              set -ex
+              export PATH=/opt/python/cp38-cp38/bin:$PATH
+              python --version
+              python -m pip install --upgrade "pip<23" "setuptools<66" "wheel==0.37.1"
+              python -c "import wheel; print(\"wheel\", wheel.__version__)"
+
+              ./autogen.sh
+              CXXFLAGS="-fPIC -g -O2" ./configure
+              make -j$(nproc)
+              ls -l src/protoc src/.libs/libprotobuf.a
+
+              cd python
+              # Generates the *_pb2.py sources that ship inside both distributions.
+              python setup.py build_py
+              # setup.cfg sets universal = 1, so a plain bdist_wheel (NO
+              # --cpp_implementation) yields the py2.py3-none-any tag.
+              python setup.py sdist bdist_wheel
+              ls -l dist
+
+              # Test suite, pure python implementation.
+              PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python python setup.py -q test
+
+              # Test suite, cpp implementation (per tox.ini).
+              export LD_LIBRARY_PATH="$(cd ../src/.libs && pwd)"
+              python setup.py -q build --cpp_implementation --compile_static_extension
+              PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=cpp \
+                python setup.py -q test --cpp_implementation
+
+              # Container writes as root; make the outputs readable to the
+              # unprivileged host user that runs upload-artifact.
+              chmod -R a+rX dist
+            '
+          ls -l python/dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist-and-pure
+          path: |
+            python/dist/protobuf-3.19.5.tar.gz
+            python/dist/protobuf-3.19.5-py2.py3-none-any.whl
+          if-no-files-found: error
+
+  # =====================================================================
+  # 2) manylinux x86_64 -> 5 artifacts (cp36, cp37, cp38, cp39, cp310)
+  #      filename tag: manylinux_2_17_x86_64.manylinux2014_x86_64
+  #    Produced by `auditwheel repair`, which is what creates the
+  #    protobuf.libs/ directory present in the real published wheels.
+  # =====================================================================
+  linux_x86_64:
+    name: manylinux x86_64 ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    # Same reasoning as sdist_and_pure above: the pinned manylinux2014 image is
+    # entered with `docker run` from a plain ubuntu-latest runner. As a
+    # job-level `container:` it cannot work at all, because the runner's
+    # injected Node 24 will not start on CentOS 7's glibc 2.17. The image tag
+    # stays pinned at 2022-09-12-1a61614 -- it is the only era-correct tag that
+    # still ships cp36/cp37/cp38, which 3 of these 5 wheels need.
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["cp36-cp36m", "cp37-cp37m", "cp38-cp38", "cp39-cp39", "cp310-cp310"]
+    steps:
+      - uses: actions/checkout@v4
+
+      # NOTE: no CentOS-vault yum fixup here. The pinned manylinux2014 image
+      # already ships autotools, g++ and every CPython this job needs, so no
+      # job in this workflow ever invokes `yum install`. The fixup was dead
+      # weight, so it was deleted rather than made conditional.
+
+      - name: Build wheel, auditwheel repair and run both test suites (in container)
+        run: |
+          set -ex
+          docker run --rm \
+            -v "$PWD":/work -w /work \
+            -e PIP_INDEX_URL="$PIP_INDEX_URL" \
+            -e SETUPTOOLS_USE_DISTUTILS="$SETUPTOOLS_USE_DISTUTILS" \
+            -e PYTAG="${{ matrix.python }}" \
+            quay.io/pypa/manylinux2014_x86_64:2022-09-12-1a61614 \
+            bash -c '
+              set -ex
+              export PATH=/opt/python/$PYTAG/bin:$PATH
+              python --version
+              # cp36 needs an older setuptools (3.6 support was dropped later).
+              if [ "$PYTAG" = "cp36-cp36m" ]; then
+                python -m pip install --upgrade "pip<22" "setuptools<60" "wheel==0.37.1"
+              else
+                python -m pip install --upgrade "pip<23" "setuptools<66" "wheel==0.37.1"
+              fi
+              python -c "import wheel; print(\"wheel\", wheel.__version__)"
+
+              # Build protoc and libprotobuf (-fPIC, per Kokoro linux/config.sh).
+              ./autogen.sh
+              CXXFLAGS="-fPIC -g -O2" ./configure
+              make -j$(nproc)
+              ls -l src/protoc src/.libs/libprotobuf.a src/.libs/libprotobuf-lite.a
+
+              cd python
+              python setup.py build_py
+              python setup.py bdist_wheel --cpp_implementation --compile_static_extension
+              ls -l dist
+              cd ..
+
+              # auditwheel repair -> manylinux_2_17_x86_64. This is what creates
+              # the protobuf.libs/ directory present in the real published wheels.
+              auditwheel repair --plat manylinux_2_17_x86_64 -w wheelhouse python/dist/*.whl
+              ls -l wheelhouse
+              # Single-line python -c on purpose: a YAML-indented multi-line
+              # snippet reaches the interpreter with leading whitespace and
+              # dies with IndentationError before asserting anything.
+              python -c "import glob, zipfile; names = zipfile.ZipFile(glob.glob(\"wheelhouse/*.whl\")[0]).namelist(); libs = [n for n in names if \"protobuf.libs\" in n]; print(\"protobuf.libs entries:\", libs); assert libs, \"auditwheel repair did not vendor libs\""
+
+              cd python
+              # Test suite, pure python implementation.
+              PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python python setup.py -q test
+
+              # Test suite, cpp implementation. tox.ini points the loader at the
+              # freshly built shared libs.
+              export LD_LIBRARY_PATH="$(cd ../src/.libs && pwd)"
+              python setup.py -q build --cpp_implementation --compile_static_extension
+              PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=cpp \
+                python setup.py -q test --cpp_implementation
+              cd ..
+
+              # Container writes as root; make the outputs readable to the
+              # unprivileged host user that runs upload-artifact.
+              chmod -R a+rX wheelhouse
+            '
+          ls -l wheelhouse
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: manylinux-x86_64-${{ matrix.python }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  # =====================================================================
+  # 3) manylinux2014 aarch64 -> 4 artifacts (cp37, cp38, cp39, cp310)
+  #    NOTE: upstream built NO cp36 aarch64 wheel, so cp36 is absent here.
+  #
+  #    No arm64 Linux runner exists on this fork, so these are CROSS-COMPILED
+  #    on x86_64 exactly as Kokoro did it
+  #    (linux/config.sh: build_crosscompiled_aarch64_artifact_version):
+  #      * dockcross/manylinux2014-aarch64 image (CC/CXX preset to the cross
+  #        toolchain, qemu-aarch64 and AUDITWHEEL_PLAT provided)
+  #      * ./configure --host=aarch64
+  #      * protoc_qemu_wrapper.sh runs the cross-built protoc under qemu so
+  #        build_py can generate the _pb2.py files without an x64 protoc
+  #      * PROTOCOL_BUFFERS_OVERRIDE_EXT_SUFFIX rewrites the .so suffix, since
+  #        the image's CPython is itself x86_64
+  #      * --plat-name=$AUDITWHEEL_PLAT for the correct wheel filename
+  #      * auditwheel repair is SKIPPED: it cannot process cross-compiled
+  #        wheels, and the real published aarch64 wheels indeed have no
+  #        protobuf.libs/ directory.
+  #      * wheel==0.36.2 -- the version this pinned image shipped.
+  #
+  #    These wheels are aarch64 binaries built on an x86_64 host, so the cpp
+  #    test suite CANNOT execute here (wrong architecture). That is expected;
+  #    the pure-python and cpp suites are covered by the linux_x86_64 job.
+  # =====================================================================
+  linux_aarch64:
+    name: manylinux2014 aarch64 ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["cp37-cp37m", "cp38-cp38", "cp39-cp39", "cp310-cp310"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cross-compile aarch64 wheel in dockcross image
+        run: |
+          set -ex
+          docker run --rm \
+            -v "$PWD":/work -w /work \
+            -e PIP_INDEX_URL="$PIP_INDEX_URL" \
+            -e SETUPTOOLS_USE_DISTUTILS="$SETUPTOOLS_USE_DISTUTILS" \
+            -e PYTAG="${{ matrix.python }}" \
+            dockcross/manylinux2014-aarch64:20210706-65bf2dd \
+            bash -c '
+              set -ex
+              export PATH=/opt/python/$PYTAG/bin:$PATH
+              python --version
+              # The pinned dockcross image already ships wheel 0.36.2 and
+              # setuptools 57.0.0; pin explicitly so the recorded
+              # "Generator: bdist_wheel (0.36.2)" cannot drift.
+              python -m pip install --upgrade "pip<22" "setuptools<60" "wheel==0.36.2"
+              python -c "import wheel; print(\"wheel\", wheel.__version__)"
+
+              ./autogen.sh
+              CXXFLAGS="-fPIC -g -O2" ./configure --host=aarch64
+              make -j$(nproc)
+
+              # Run the cross-built aarch64 protoc under qemu (Kokoro trick).
+              echo "#!/bin/bash" > protoc_qemu_wrapper.sh
+              echo "exec qemu-aarch64 \"../src/protoc\" \"\$@\"" >> protoc_qemu_wrapper.sh
+              chmod ugo+x protoc_qemu_wrapper.sh
+
+              cd python
+              # PROTOC is consumed by setup.py, which runs from ./python.
+              export PROTOC=../protoc_qemu_wrapper.sh
+              python setup.py build_py
+
+              # The image CPython is x86_64, so force the aarch64 .so suffix.
+              export PROTOCOL_BUFFERS_OVERRIDE_EXT_SUFFIX="$(python -c "import sysconfig; print(sysconfig.get_config_var(\"EXT_SUFFIX\").replace(\"-x86_64-linux-gnu.so\", \"-aarch64-linux-gnu.so\"))")"
+              echo "EXT_SUFFIX override: $PROTOCOL_BUFFERS_OVERRIDE_EXT_SUFFIX"
+
+              python setup.py bdist_wheel --cpp_implementation \
+                --compile_static_extension --plat-name=$AUDITWHEEL_PLAT
+              ls -l dist
+            '
+          ls -l python/dist
+
+      - name: Verify wheel is aarch64-tagged and unrepaired
+        run: |
+          set -ex
+          ls python/dist/*.whl
+          test -n "$(ls python/dist/*manylinux2014_aarch64.whl)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: manylinux-aarch64-${{ matrix.python }}
+          path: python/dist/*.whl
+          if-no-files-found: error
+
+  # =====================================================================
+  # 4) macOS x86_64 -> 4 artifacts (cp36, cp37, cp38, cp39), macosx_10_9_x86_64
+  #    NOTE: upstream published NO cp310 macOS wheel for 3.19.5 (same kind of
+  #    per-platform gap as the missing cp36 aarch64 wheel above), so cp310 is
+  #    absent from this matrix. Verified against the PyPI file list for
+  #    3.19.5, which contains exactly these four macosx_10_9_x86_64 wheels.
+  #
+  #    Every macOS runner available on this fork (macos-latest/15/14) is
+  #    arm64 Apple Silicon and there is no Rosetta, so the x86_64 wheels are
+  #    CROSS-COMPILED, in the same spirit as the aarch64 Linux legs above.
+  #
+  #    protoc/libprotobuf are built ONCE as universal2 (-arch arm64 -arch
+  #    x86_64) rather than twice:
+  #      * the resulting `src/protoc` has an arm64 slice, so it RUNS natively
+  #        on the runner and `setup.py build_py` can generate the _pb2.py
+  #        sources without Rosetta and without a second native build;
+  #      * the same fat libprotobuf.a/libprotobuf-lite.a archives carry an
+  #        x86_64 slice, which is what the linker selects when the extension
+  #        is compiled with `-arch x86_64`.
+  #    `--disable-dependency-tracking` is required: clang rejects the -MD
+  #    depcomp flags automake passes by default when several -arch are given.
+  #
+  #    The wheel tag is forced to macosx_10_9_x86_64 via _PYTHON_HOST_PLATFORM
+  #    + ARCHFLAGS + --plat-name so the filename matches the published artifact
+  #    exactly. MACOSX_DEPLOYMENT_TARGET is deliberately NOT pinned to 10.9 for
+  #    the extension build -- see the wheel step below. wheel==0.37.1 stays.
+  # =====================================================================
+  macos:
+    name: macOS x86_64 py${{ matrix.python }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.6", "3.7", "3.8", "3.9"]
+    steps:
+      - uses: actions/checkout@v4
+
+      # actions/setup-python publishes no darwin-arm64 builds this old (arm64
+      # macOS coverage effectively starts well above 3.9), so ALL four legs
+      # use this drop-in replacement, which builds the interpreter from source
+      # and caches it. The interpreter is native arm64 -- only the C++
+      # extension is cross-compiled to x86_64.
+      - name: Set up Python ${{ matrix.python }} (built from source on arm64)
+        uses: MatteoH2O1999/setup-python@v4
+        with:
+          python-version: ${{ matrix.python }}
+          allow-build: allow
+          cache-build: true
+
+      - name: Install build tools
+        run: |
+          set -ex
+          brew install autoconf automake libtool
+          python --version
+          python -c "import platform; print('host machine:', platform.machine())"
+          python -c "import sysconfig; print('interpreter target:', sysconfig.get_config_var('MACOSX_DEPLOYMENT_TARGET'))"
+          if [ "${{ matrix.python }}" = "3.6" ]; then
+            python -m pip install --upgrade "pip<22" "setuptools<60" "wheel==0.37.1"
+          else
+            python -m pip install --upgrade "pip<23" "setuptools<66" "wheel==0.37.1"
+          fi
+          python -c "import wheel; print('wheel', wheel.__version__)"
+
+      - name: Build universal2 protoc and libprotobuf (per Kokoro macos/config.sh)
+        run: |
+          set -ex
+          ./autogen.sh
+          ARCHES="-arch arm64 -arch x86_64"
+          CFLAGS="$ARCHES -fPIC -g -O2" \
+          CXXFLAGS="$ARCHES -std=c++14 -fPIC -g -O2" \
+          LDFLAGS="$ARCHES" \
+            ./configure --disable-dependency-tracking
+          make -j$(sysctl -n hw.ncpu)
+          ls -l src/protoc src/.libs/protoc src/.libs/libprotobuf.a src/.libs/libprotobuf-lite.a
+          # `src/protoc` is a libtool WRAPPER SHELL SCRIPT, not a Mach-O binary
+          # (it execs the real thing), so lipo cannot read it -- the real binary
+          # lives at src/.libs/protoc. Inspect that one instead.
+          lipo -info src/.libs/protoc
+          lipo -info src/.libs/libprotobuf.a
+          # The wrapper runs fine, which is all build_py needs from it.
+          ./src/protoc --version
+
+      - name: Build wheel (cpp implementation, static extension, x86_64)
+        run: |
+          set -ex
+          cd python
+          # Codegen only: invokes ../src/protoc, which runs natively here.
+          python setup.py build_py
+
+          # distutils refuses to spawn the compiler when the environment's
+          # MACOSX_DEPLOYMENT_TARGET is LOWER than the value the interpreter
+          # itself was configured with ("$MACOSX_DEPLOYMENT_TARGET mismatch:
+          # now 10.9 but 11 during configure"). The setup-python replacement
+          # used here BUILDS CPython from source on this arm64 runner with
+          # target 11 baked into sysconfig, so exporting a flat 10.9 breaks
+          # cp36/cp37/cp38. Export the interpreter's OWN configured target
+          # whenever it is higher than 10.9, and keep 10.9 otherwise (which is
+          # what the prebuilt, already-passing interpreters resolve to) --
+          # this variable only feeds that compiler check.
+          # Single-line python -c on purpose: a YAML-indented multi-line
+          # snippet reaches the interpreter with leading whitespace and dies
+          # with IndentationError.
+          CFG_TARGET="$(python -c "import sysconfig; print(sysconfig.get_config_var('MACOSX_DEPLOYMENT_TARGET') or '10.9')")"
+          DEPLOYMENT_TARGET="$(python -c "import sys; cfg = sys.argv[1]; print(cfg if tuple(int(p) for p in cfg.split('.')) > (10, 9) else '10.9')" "$CFG_TARGET")"
+          echo "interpreter configured target=$CFG_TARGET -> exporting MACOSX_DEPLOYMENT_TARGET=$DEPLOYMENT_TARGET"
+
+          # The wheel TAG does not come from MACOSX_DEPLOYMENT_TARGET:
+          # ARCHFLAGS replaces the interpreter's own -arch arm64 flags,
+          # _PYTHON_HOST_PLATFORM fixes the build/ dir and the default
+          # platform tag, and --plat-name pins the wheel filename, so the
+          # artifact stays macosx_10_9_x86_64 on every leg.
+          MACOSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
+          ARCHFLAGS="-arch x86_64" \
+          _PYTHON_HOST_PLATFORM="macosx-10.9-x86_64" \
+            python setup.py bdist_wheel --cpp_implementation \
+              --compile_static_extension --plat-name=macosx_10_9_x86_64
+          ls -l dist
+
+      - name: Verify wheel is x86_64-tagged and holds an x86_64 extension
+        run: |
+          set -ex
+          ls python/dist/*-macosx_10_9_x86_64.whl
+          rm -rf /tmp/whlcheck
+          mkdir -p /tmp/whlcheck
+          cd /tmp/whlcheck
+          unzip -q "$GITHUB_WORKSPACE"/python/dist/*-macosx_10_9_x86_64.whl
+          SO="$(find . -name '_message*.so' -print -quit)"
+          test -n "$SO"
+          lipo -info "$SO"
+          # The built slice must really be x86_64, or the tag would be a lie.
+          lipo -archs "$SO" | tr ' ' '\n' | grep -qx 'x86_64'
+
+      - name: Run test suite - pure python implementation
+        run: |
+          set -ex
+          cd python
+          PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python python setup.py -q test
+
+      # There is deliberately NO cpp-implementation test step on macOS: the
+      # extension built above is x86_64 while this runner is arm64 with no
+      # Rosetta, so the freshly built _message.so physically cannot be
+      # imported here. Nothing is masked and no test is deselected -- the
+      # identical cpp suite runs to completion on the linux_x86_64 and
+      # windows jobs, which exercise the same C++ code paths.
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-x86_64-py${{ matrix.python }}
+          path: python/dist/*-macosx_10_9_x86_64.whl
+          if-no-files-found: error
+
+  # =====================================================================
+  # 5) Windows -> 10 artifacts: {win32, win_amd64} x {cp36..cp310}
+  #    Mirrors windows/build_single_artifact.bat: cmake-generate, msbuild
+  #    libprotobuf + libprotobuf-lite in Release, copy the .lib files to
+  #    src/.libs/libprotobuf.a and libprotobuf-lite.a (the names setup.py
+  #    hardcodes in extra_objects), then put the protoc dir on PATH.
+  #
+  #    Deviations from the .bat, both unavoidable:
+  #      * The "Visual Studio 14" (2015) generator is gone from modern
+  #        runners; the runner's default VS generator is used with an explicit
+  #        -A Win32/x64 platform. All protobuf_* cmake flags are unchanged.
+  #      * zlib is NOT fetched: the upstream winimage.com URLs are dead, and
+  #        zlib is optional for the Python extension.
+  # =====================================================================
+  windows:
+    name: Windows ${{ matrix.arch }} py${{ matrix.python }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.6", "3.7", "3.8", "3.9", "3.10"]
+        arch: ["x86", "x64"]
+    steps:
+      # text_format_test compares generated output against golden testdata that
+      # test_util.GoldenFile opens 'rb', so a CRLF-translating checkout makes the
+      # expected side \r\n while protobuf emits \n. Kokoro checked out LF; match it.
+      - name: Check out with LF line endings
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }} (${{ matrix.arch }})
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          architecture: ${{ matrix.arch }}
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -ex
+          python --version
+          python -c "import struct; print(struct.calcsize('P') * 8)"
+          if [ "${{ matrix.python }}" = "3.6" ]; then
+            python -m pip install --upgrade "pip<22" "setuptools<60" "wheel==0.37.1"
+          else
+            python -m pip install --upgrade "pip<23" "setuptools<66" "wheel==0.37.1"
+          fi
+          python -c "import wheel; print('wheel', wheel.__version__)"
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Build libprotobuf and protoc (MSVC Release)
+        shell: cmd
+        run: |
+          if "${{ matrix.arch }}"=="x86" (set VCPLATFORM=Win32) else (set VCPLATFORM=x64)
+          mkdir src\.libs
+          mkdir vcprojects
+          cd vcprojects
+          cmake -A %VCPLATFORM% -Dprotobuf_BUILD_SHARED_LIBS=OFF -Dprotobuf_UNICODE=ON -Dprotobuf_BUILD_TESTS=OFF ../cmake || exit /b 1
+          msbuild protobuf.sln /m /p:Platform=%VCPLATFORM% /p:Configuration=Release || exit /b 1
+          cd ..
+          copy vcprojects\Release\libprotobuf.lib src\.libs\libprotobuf.a || exit /b 1
+          copy vcprojects\Release\libprotobuf-lite.lib src\.libs\libprotobuf-lite.a || exit /b 1
+          REM setup.py's non-static path links `protobuf` (i.e. protobuf.lib), so
+          REM keep MSVC-named copies too: any build reached without
+          REM --compile_static_extension then links instead of LNK1181.
+          copy vcprojects\Release\libprotobuf.lib src\.libs\protobuf.lib || exit /b 1
+          copy vcprojects\Release\libprotobuf-lite.lib src\.libs\protobuf-lite.lib || exit /b 1
+          dir vcprojects\Release
+
+      - name: Build wheel (cpp implementation, static extension)
+        shell: cmd
+        run: |
+          set PATH=%CD%\vcprojects\Release;%PATH%
+          cd python
+          python setup.py build_py || exit /b 1
+          python setup.py bdist_wheel --cpp_implementation --compile_static_extension || exit /b 1
+          dir dist
+
+      - name: Run test suite - pure python implementation
+        shell: cmd
+        run: |
+          set PATH=%CD%\vcprojects\Release;%PATH%
+          cd python
+          set PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+          python setup.py -q test || exit /b 1
+
+      - name: Run test suite - cpp implementation
+        shell: cmd
+        run: |
+          set PATH=%CD%\vcprojects\Release;%PATH%
+          cd python
+          python setup.py -q build --cpp_implementation --compile_static_extension || exit /b 1
+          set PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=cpp
+          python setup.py -q test --cpp_implementation || exit /b 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}-py${{ matrix.python }}
+          path: python/dist/*.whl
+          if-no-files-found: error
